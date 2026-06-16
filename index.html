@@ -1,0 +1,544 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>Gesture AR</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      width:100vw; height:100vh; overflow:hidden;
+      background:#000;
+      font-family:'Courier New', monospace;
+    }
+    #container { position:relative; width:100%; height:100%; }
+
+    #webcam {
+      position:absolute; inset:0;
+      width:100%; height:100%;
+      object-fit:cover;
+      transform:scaleX(-1);
+      z-index:1;
+    }
+    #canvas3d {
+      position:absolute; top:0; left:0;
+      width:100%; height:100%;
+      z-index:2; pointer-events:none;
+    }
+
+    /* HUD — minimal, top-left */
+    #hud {
+      position:absolute;
+      top:max(16px, env(safe-area-inset-top, 16px));
+      left:16px;
+      z-index:3; pointer-events:none;
+      color:#00ffcc;
+      font-size:clamp(9px,2.2vw,12px);
+      line-height:1.9;
+      letter-spacing:0.12em;
+      background:rgba(0,0,0,0.42);
+      padding:10px 14px;
+      border-left:2px solid rgba(0,255,204,0.6);
+      text-shadow:0 0 7px rgba(0,255,204,0.6);
+    }
+    .hl { color:rgba(0,255,204,0.45); }
+
+    /* Mode tag — bottom centre */
+    #tag {
+      position:absolute;
+      bottom:max(24px, env(safe-area-inset-bottom, 24px));
+      left:50%; transform:translateX(-50%);
+      z-index:3; pointer-events:none;
+      color:#00ffcc;
+      font-size:clamp(9px,2vw,11px);
+      letter-spacing:0.32em;
+      background:rgba(0,0,0,0.48);
+      padding:5px 14px;
+      border:1px solid rgba(0,255,204,0.25);
+      text-shadow:0 0 8px rgba(0,255,204,0.7);
+      white-space:nowrap;
+    }
+
+    /* Loading */
+    #loading {
+      position:absolute; inset:0; z-index:10;
+      background:#000;
+      display:flex; flex-direction:column;
+      align-items:center; justify-content:center; gap:18px;
+      color:#00ffcc;
+      font-size:clamp(12px,3vw,16px);
+      letter-spacing:0.22em;
+      text-shadow:0 0 10px #00ffcc;
+      text-align:center; padding:24px;
+    }
+    .bar-wrap { width:min(260px,68vw); height:2px; background:rgba(0,255,204,0.1); overflow:hidden; }
+    .bar { height:100%; background:linear-gradient(90deg,transparent,#00ffcc,transparent); animation:sw 1.5s linear infinite; }
+    @keyframes sw { from{transform:translateX(-100%)} to{transform:translateX(300%)} }
+  </style>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="container">
+  <div id="loading">
+    <div>INITIALISING</div>
+    <div class="bar-wrap"><div class="bar"></div></div>
+    <div style="font-size:0.6em;opacity:0.4;letter-spacing:0.15em">LOADING HAND TRACKING</div>
+  </div>
+
+  <div id="hud">
+    <span class="hl">MODE&nbsp;&nbsp;</span><span id="h-mode">IDLE</span><br>
+    <span class="hl">SCALE&nbsp;</span><span id="h-scale">1.00</span>
+  </div>
+
+  <div id="tag">SHOW YOUR HAND</div>
+
+  <video id="webcam" autoplay playsinline muted></video>
+  <canvas id="canvas3d"></canvas>
+</div>
+
+<script>
+// ── DOM ──────────────────────────────────────────────────────────────────────
+const videoEl   = document.getElementById('webcam');
+const canvasEl  = document.getElementById('canvas3d');
+const loadingEl = document.getElementById('loading');
+const hMode     = document.getElementById('h-mode');
+const hScale    = document.getElementById('h-scale');
+const tag       = document.getElementById('tag');
+
+let W = window.innerWidth;
+let H = window.innerHeight;
+
+// ── RENDERER ─────────────────────────────────────────────────────────────────
+const scene    = new THREE.Scene();
+const camera3d = new THREE.PerspectiveCamera(60, W / H, 0.1, 1000);
+camera3d.position.z = 5;
+
+// Mobile: pixel ratio 1 for performance; desktop can handle 2
+const isMobile = /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent);
+const renderer = new THREE.WebGLRenderer({ canvas: canvasEl, alpha: true, antialias: !isMobile });
+renderer.setPixelRatio(isMobile ? 1 : Math.min(window.devicePixelRatio, 2));
+renderer.setSize(W, H);
+
+window.addEventListener('resize', () => {
+  W = window.innerWidth; H = window.innerHeight;
+  camera3d.aspect = W / H;
+  camera3d.updateProjectionMatrix();
+  renderer.setSize(W, H);
+});
+
+// ── LIGHTS ───────────────────────────────────────────────────────────────────
+// Three-point setup for a convincing metallic look
+// Key: cool-white from upper right
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.6);
+keyLight.position.set(3, 5, 4);
+scene.add(keyLight);
+
+// Fill: warm from lower left — gives the cube two-tone interest
+const fillLight = new THREE.DirectionalLight(0xffa040, 0.55);
+fillLight.position.set(-4, -2, 2);
+scene.add(fillLight);
+
+// Rim: cyan accent from behind — the holographic signature
+const rimLight = new THREE.DirectionalLight(0x00ffcc, 0.7);
+rimLight.position.set(0, 2, -5);
+scene.add(rimLight);
+
+// Soft ambient so dark faces don't go pitch black
+scene.add(new THREE.AmbientLight(0x112233, 1.8));
+
+// ── CUBE ─────────────────────────────────────────────────────────────────────
+const shapeGroup = new THREE.Group();
+shapeGroup.visible = false;
+scene.add(shapeGroup);
+
+const cubeGeo = new THREE.BoxGeometry(1, 1, 1);
+
+// Solid metallic material — no transparency, deep steel-blue base
+const cubeMat = new THREE.MeshStandardMaterial({
+  color:     0x0a1628,   // very dark blue-grey base
+  emissive:  0x001833,
+  emissiveIntensity: 0.3,
+  metalness: 1.0,
+  roughness: 0.12,       // very shiny — you can see the lights reflected
+});
+const cubeMesh = new THREE.Mesh(cubeGeo, cubeMat);
+shapeGroup.add(cubeMesh);
+
+// Fine edge lines — thin, barely glowing
+const edgeMat = new THREE.LineBasicMaterial({ color: 0x44ddff, transparent: true, opacity: 0.55 });
+shapeGroup.add(new THREE.LineSegments(new THREE.EdgesGeometry(cubeGeo), edgeMat));
+
+// ── CONTACT SHADOW — dark oval, no colour bleed ───────────────────────────────
+// This sits below the cube and scales/fades as squish increases.
+// Uses a simple dark transparent disc — no additive blending, no colour.
+const shadowDisc = new THREE.Mesh(
+  new THREE.CircleGeometry(1, 36),
+  new THREE.MeshBasicMaterial({
+    color: 0x000000,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+  })
+);
+shadowDisc.rotation.x = -Math.PI / 2;
+scene.add(shadowDisc);
+
+// ── HOLOGRAPHIC BOUNDING BOX (always visible, slow ambient rotation) ─────────
+const boundMat = new THREE.LineBasicMaterial({ color: 0x00ffcc, transparent: true, opacity: 0.12 });
+const boundBox = new THREE.LineSegments(
+  new THREE.EdgesGeometry(new THREE.BoxGeometry(2.6, 2.6, 2.6)), boundMat
+);
+scene.add(boundBox);
+
+// ── TWO-HAND BEAM ─────────────────────────────────────────────────────────────
+const beamGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+const beamMat = new THREE.LineBasicMaterial({ color: 0xffd600, transparent: true, opacity: 0 });
+scene.add(new THREE.Line(beamGeo, beamMat));
+
+// ── COORDINATE MAPPING ───────────────────────────────────────────────────────
+// Identical formula to the working reference file
+function mpToWorld(lm) {
+  return {
+    x: (1 - lm.x * 2) * (W / H) * 2.2,
+    y: (1 - lm.y * 2) * 2.2,
+  };
+}
+
+// Euclidean pinch in normalised MP space (includes z for accuracy)
+function pinchDist(lms) {
+  const a = lms[4], b = lms[8];
+  return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2 + (a.z-b.z)**2);
+}
+
+// Index extended, rest curled
+function isPointing(lms) {
+  return lms[8].y < lms[6].y && lms[12].y > lms[10].y && lms[16].y > lms[14].y;
+}
+
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function lp(a, b, t)      { return a + (b - a) * t; }
+
+// ── ANIMATION STATE ──────────────────────────────────────────────────────────
+let posX = 0, posY = 0;    // smoothed world position
+let tgtX = 0, tgtY = 0;
+
+// Rotation (accumulated, never resets)
+let rotX = 0, rotY = 0;
+let spinRateX = 0.005, spinRateY = 0.012;   // current rates
+let tgtSpinX  = 0.005, tgtSpinY  = 0.012;  // targets
+
+// Scale
+let uniScale = 1,  tgtUni = 1;
+let sclX = 1,      tgtSclX = 1;
+let sclY = 1,      tgtSclY = 1;
+
+// Squish Y multiplier (1 = normal, <1 = flat)
+let squishY = 1, tgtSquishY = 1;
+
+// Two-hand
+let prevTwoAngle = null;
+
+// Dropout grace — don't snap on brief loss
+let dropFrames = 0;
+const GRACE = 6;
+
+// Mode
+let mode = 'IDLE';
+
+// Manual time for bounding box / ring animation
+let tick = 0;
+
+// ── RAF RENDER LOOP (decoupled from MediaPipe for smoothness) ─────────────────
+// We store the latest tracking data here and apply it every RAF frame,
+// so even if MediaPipe runs at 15–20fps, visuals interpolate at 60fps.
+let latestData = null;  // filled by onHandResults
+
+function rafLoop() {
+  requestAnimationFrame(rafLoop);
+  tick += 0.018;
+
+  // Ambient scene always animates
+  boundBox.rotation.y += 0.0016;
+  boundBox.rotation.x += 0.0006;
+
+  // If we have tracking data, keep lerping toward it
+  if (latestData) {
+    applyTracking(latestData);
+  }
+
+  renderer.render(scene, camera3d);
+}
+rafLoop();
+
+// ── TRACKING APPLICATION (called every RAF with latest data) ──────────────────
+function applyTracking(d) {
+  // Smooth position
+  posX = lp(posX, tgtX, 0.20);
+  posY = lp(posY, tgtY, 0.20);
+  shapeGroup.position.set(posX, posY, 0);
+
+  // Smooth spin rates then accumulate
+  spinRateX = lp(spinRateX, tgtSpinX, 0.07);
+  spinRateY = lp(spinRateY, tgtSpinY, 0.07);
+  rotX += spinRateX;
+  rotY += spinRateY;
+  shapeGroup.rotation.set(rotX, rotY, 0);
+
+  // Smooth scales
+  uniScale  = lp(uniScale,  tgtUni,     0.12);
+  sclX      = lp(sclX,      tgtSclX,    0.10);
+  sclY      = lp(sclY,      tgtSclY,    0.10);
+  squishY   = lp(squishY,   tgtSquishY, 0.16);
+
+  const fX = uniScale * sclX;
+  const fY = uniScale * sclY * squishY;
+  const fZ = uniScale;
+  shapeGroup.scale.set(fX, fY, fZ);
+
+  // Contact shadow — dark oval below, fades in during squish
+  const sq = clamp(1 - squishY, 0, 1);
+  shadowDisc.material.opacity = sq * 0.38;
+  if (sq > 0.01) {
+    shadowDisc.position.set(posX, posY - fY * 0.52, 0);
+    shadowDisc.scale.setScalar(fX * (0.9 + sq * 1.8));
+  }
+
+  // Update HUD (throttled to avoid layout thrash every frame)
+  if (tick % 0.09 < 0.018) {
+    hMode.textContent  = mode;
+    hScale.textContent = uniScale.toFixed(2);
+  }
+}
+
+// ── MEDIAPIPE RESULTS ────────────────────────────────────────────────────────
+function onHandResults(results) {
+  const lmArr = results.multiHandLandmarks || [];
+  const hnArr = results.multiHandedness    || [];
+  const n     = lmArr.length;
+
+  if (n === 0) {
+    dropFrames++;
+    if (dropFrames > GRACE) {
+      shapeGroup.visible = false;
+      beamMat.opacity    = 0;
+      prevTwoAngle       = null;
+      mode = 'IDLE';
+      tag.textContent = 'SHOW YOUR HAND';
+      // Gently coast back to neutral — no snapping
+      tgtSclX = 1; tgtSclY = 1; tgtSquishY = 1;
+      tgtSpinX = 0.005; tgtSpinY = 0.012;
+    }
+    latestData = {};  // keep animating last position
+    return;
+  }
+
+  dropFrames = 0;
+  shapeGroup.visible = true;
+
+  // ── Identify dominant vs off-hand ────────────────────────────────────────
+  // MediaPipe's 'Right' label = user's right (mirrored feed).
+  // We treat Right as dominant. If both are same label, index 0 = dominant.
+  let domIdx = 0, offIdx = -1;
+  if (n === 2) {
+    const l0 = hnArr[0] ? hnArr[0].label : 'Right';
+    const l1 = hnArr[1] ? hnArr[1].label : 'Left';
+    domIdx = (l0 === 'Right') ? 0 : 1;
+    offIdx = domIdx === 0 ? 1 : 0;
+  }
+
+  const domLms = lmArr[domIdx];
+  const offLms = offIdx >= 0 ? lmArr[offIdx] : null;
+  const pd     = pinchDist(domLms);
+
+  // Dominant hand position: midpoint index-thumb
+  const mw = mpToWorld({ x: (domLms[4].x + domLms[8].x) * 0.5, y: (domLms[4].y + domLms[8].y) * 0.5 });
+  tgtX = mw.x;
+  tgtY = mw.y;
+
+  // ────────────────────────────────────────────────────────────────────────
+  // TWO-HAND MODE
+  // ────────────────────────────────────────────────────────────────────────
+  if (offLms) {
+    mode = 'TWO HAND';
+    beamMat.opacity = 0.4;
+
+    // Use index tips of both hands as control points — most responsive
+    const dp = mpToWorld(domLms[8]);
+    const op = mpToWorld(offLms[8]);
+
+    // Shape sits at midpoint of the two index tips
+    tgtX = (dp.x + op.x) * 0.5;
+    tgtY = (dp.y + op.y) * 0.5;
+
+    // Update beam
+    const bp = beamGeo.attributes.position;
+    bp.setXYZ(0, dp.x, dp.y, 0);
+    bp.setXYZ(1, op.x, op.y, 0);
+    bp.needsUpdate = true;
+
+    // ROTATION: angle between the two tips drives rotY
+    const angle = Math.atan2(op.y - dp.y, op.x - dp.x);
+    if (prevTwoAngle !== null) {
+      let da = angle - prevTwoAngle;
+      if (da >  Math.PI) da -= Math.PI * 2;
+      if (da < -Math.PI) da += Math.PI * 2;
+      rotY += da * 2.6;
+    }
+    prevTwoAngle = angle;
+    tgtSpinX = 0; tgtSpinY = 0; // no auto-spin in two-hand
+
+    // STRETCH vs UNIFORM SCALE: determined by angle between hands
+    const normDx = Math.abs(domLms[8].x - offLms[8].x);
+    const normDy = Math.abs(domLms[8].y - offLms[8].y);
+    const sepAng = Math.atan2(normDy, normDx);
+
+    const THRESH = Math.PI / 5; // 36 degrees
+
+    if (sepAng < THRESH) {
+      // ── STRETCH X: hands side by side ──────────────────────────────────
+      const sf = clamp(1 + normDx * 5.0, 0.5, 4.0);
+      tgtSclX     = sf;
+      tgtSclY     = clamp(1 / Math.sqrt(sf), 0.28, 1.0);
+      tgtUni      = 1.0;
+      tgtSquishY  = 1.0;
+      mode = 'STRETCH X';
+      tag.textContent = 'STRETCH X';
+
+    } else if (sepAng > Math.PI / 2 - THRESH) {
+      // ── STRETCH Y: hands stacked vertically ────────────────────────────
+      const sf = clamp(1 + normDy * 5.0, 0.5, 4.0);
+      tgtSclY     = sf;
+      tgtSclX     = clamp(1 / Math.sqrt(sf), 0.28, 1.0);
+      tgtUni      = 1.0;
+      tgtSquishY  = 1.0;
+      mode = 'STRETCH Y';
+      tag.textContent = 'STRETCH Y';
+
+    } else {
+      // ── UNIFORM SCALE: diagonal separation ─────────────────────────────
+      const dist = Math.sqrt(normDx * normDx + normDy * normDy);
+      tgtUni      = clamp(0.25 + dist * 4.2, 0.25, 3.5);
+      tgtSclX     = 1.0;
+      tgtSclY     = 1.0;
+      tgtSquishY  = 1.0;
+      mode = 'SCALE';
+      tag.textContent = 'SCALE';
+    }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // SQUISH MODE: only the non-dominant (Left) hand visible alone
+  // ────────────────────────────────────────────────────────────────────────
+  } else if (n === 1 && hnArr[0] && hnArr[0].label === 'Left') {
+    prevTwoAngle = null;
+    beamMat.opacity = 0;
+    mode = 'SQUISH';
+    tag.textContent = 'SQUISH';
+
+    // Stop ALL rotation while squishing — feels physical
+    tgtSpinX = 0;
+    tgtSpinY = 0;
+
+    // Reset stretch
+    tgtSclX = 1.0;
+    tgtSclY = 1.0;
+
+    // The gap between thumb tip and index tip IS the squish aperture.
+    // We map the real world gap to the cube's Y scale.
+    //
+    // Open hand (pd ~0.28+) → cube at natural scale
+    // Tight pinch (pd ~0.03) → cube squished very flat
+    //
+    // We also make the cube's Y scale track the ACTUAL gap so it literally
+    // "fits through" the finger gap — the top of the cube = index tip,
+    // bottom = thumb tip.
+    //
+    // 1. Compute raw gap in world units (vertical component between tips)
+    const idxW   = mpToWorld(domLms[8]);
+    const thmW   = mpToWorld(domLms[4]);
+
+    // The gap in world Y between the two fingertips
+    const fingerGapY = Math.abs(idxW.y - thmW.y);
+
+    // The midpoint between the two tips is where the cube centre sits
+    tgtX = (idxW.x + thmW.x) * 0.5;
+    tgtY = (idxW.y + thmW.y) * 0.5;
+
+    // Map finger gap to cube height.
+    // Natural cube height at scale 1 = 1 world unit.
+    // We want the cube height to match the gap → squishY = fingerGapY / uniScale
+    // Clamp so it can't disappear or explode.
+    const naturalHeight = uniScale; // world-unit height when squishY=1
+    const targetHeight  = clamp(fingerGapY, 0.05, naturalHeight * 1.02);
+    tgtSquishY = clamp(targetHeight / Math.max(naturalHeight, 0.01), 0.05, 1.0);
+
+    // Scale stays at whatever it was — don't reset uniScale during squish
+
+  // ────────────────────────────────────────────────────────────────────────
+  // ONE HAND (DOMINANT)
+  // ────────────────────────────────────────────────────────────────────────
+  } else {
+    prevTwoAngle = null;
+    beamMat.opacity = 0;
+
+    // Leaving squish/stretch: return to neutral
+    tgtSclX    = 1.0;
+    tgtSclY    = 1.0;
+    tgtSquishY = 1.0;
+
+    if (isPointing(domLms)) {
+      // ── SPIN ─────────────────────────────────────────────────────────────
+      tgtSpinY = 0.20;  // rad/frame @ ~60fps ≈ 12 rad/s — very fast
+      tgtSpinX = 0.045;
+      mode = 'SPIN';
+      tag.textContent = 'SPIN';
+
+      // Position follows index tip while pointing
+      const iw = mpToWorld(domLms[8]);
+      tgtX = iw.x; tgtY = iw.y;
+
+    } else {
+      // ── SCALE (dominant pinch) ────────────────────────────────────────────
+      // Smoothstep: small gap = dramatic small cube, large gap = big cube
+      const t = clamp((pd - 0.02) / 0.36, 0, 1);
+      tgtUni   = 0.18 + t * t * (3 - 2 * t) * 2.32;
+
+      tgtSpinY = 0.012;
+      tgtSpinX = 0.005;
+      mode = 'SCALE';
+      tag.textContent = 'SCALE';
+    }
+  }
+
+  latestData = { n };
+}
+
+// ── MEDIAPIPE INIT ───────────────────────────────────────────────────────────
+function initMediaPipe() {
+  const hands = new Hands({
+    locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+  });
+  hands.setOptions({
+    maxNumHands:           2,
+    modelComplexity:       0,   // 0 = fast, good enough for gestures
+    minDetectionConfidence:0.65,
+    minTrackingConfidence: 0.55,
+  });
+  hands.onResults(onHandResults);
+
+  const cam = new Camera(videoEl, {
+    onFrame: async () => { await hands.send({ image: videoEl }); },
+    width:  1280,
+    height: 720,
+  });
+  cam.start().then(() => { loadingEl.style.display = 'none'; });
+}
+
+initMediaPipe();
+</script>
+</body>
+</html>
